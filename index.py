@@ -1,8 +1,10 @@
 import time
 import math
 import sys
+import os
+import csv
 
-# Terminal Raw Input Handler
+# --- INPUT HANDLER ---
 try:
     import tty, termios
     def get_key():
@@ -19,144 +21,146 @@ except ImportError:
     def get_key():
         return msvcrt.getch().decode('utf-8')
 
+class DataManager:
+    def __init__(self, filename="control_results.csv"):
+        self.filename = filename
+        self.headers = ["participant_id", "q_id", "is_correct", "latency"]
+        if not os.path.exists(self.filename):
+            self.create_headers()
+
+    def create_headers(self):
+        with open(self.filename, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(self.headers)
+
+    def log_control_result(self, p_id, q_id, is_correct, lat):
+        with open(self.filename, 'a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([p_id, q_id, is_correct, round(lat, 3)])
+
+    def get_p_obj_map(self):
+        p_obj_map = {}
+        q_stats = {}
+        if not os.path.exists(self.filename): return {}
+        with open(self.filename, 'r') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                q_id, is_correct = row['q_id'], int(row['is_correct'])
+                if q_id not in q_stats: q_stats[q_id] = []
+                q_stats[q_id].append(is_correct)
+        for q_id, results in q_stats.items():
+            p_obj_map[q_id] = sum(results) / len(results)
+        return p_obj_map
+
 class EpistemicGuardian:
-    def __init__(self):
-        # Configuration
-        self.nudge_threshold = 0.30 
-        self.min_processing_time = 0.5 # Fastest possible human response
-        
-        self.personal_stats = {'latency': []}
-        self.results_control = []
-        self.results_exp = []
-        self.nudges_triggered = 0
+    def __init__(self, mode):
+        self.mode = mode
+        self.manager = DataManager()
+        self.p_obj_map = self.manager.get_p_obj_map() if mode == "E" else {}
+        self.nudge_threshold = 0.35
+        self.tau = 25.0 
+        self.nudges = 0
         self.corrections = 0
 
-    def calculate_scaled_bci(self, lat):
-        """
-        Scales BCI from 1.0 (at min_processing_time) 
-        downward based on the personal average.
-        """
-        if not self.personal_stats['latency']:
-            return 0.5 # Default if no calibration
-            
-        avg_lat = sum(self.personal_stats['latency']) / len(self.personal_stats['latency'])
-        
-        # Linear Decay Formula: 
-        # If lat <= min_processing_time, BCI = 1.0
-        # If lat >= avg_lat, BCI approaches 0.0 (or a baseline)
-        if lat <= self.min_processing_time:
-            return 1.0
-        
-        # Calculate how far between "instant" and "average" the user is
-        # BCI = 1 - ((current - min) / (average - min))
-        slope_range = max(1.0, avg_lat - self.min_processing_time)
-        bci = 1.0 - ((lat - self.min_processing_time) / slope_range)
-        
-        return max(0.0, min(1.0, bci))
+    def print_p_obj_summary(self):
+        print(f"\n{'='*45}")
+        print(f"{'Question ID':<15} | {'Group A Accuracy (P_obj)':<25}")
+        print("-" * 45)
+        for q_id in ["CRT_A", "CRT_B", "CRT_C", "CRT_D", "CRT_E"]:
+            val = self.p_obj_map.get(q_id, 0.0)
+            print(f"{q_id:<15} | {val:<25.2%}")
+        print(f"{'='*45}\n")
+
+    def calculate_bci(self, lat):
+        # 1.0 at 0.5s, decreases as time increases.
+        if lat <= 0.5: return 1.0
+        return math.exp(-(lat - 0.5) / self.tau)
 
     def tracked_input(self):
         chars = []
         start_time = time.time()
-        first_key_time = None
         while True:
             char = get_key()
-            if not first_key_time: first_key_time = time.time()
             if char in ('\r', '\n'):
-                sys.stdout.write('\n')
-                break
+                sys.stdout.write('\n'); break
             elif char in ('\x7f', '\x08'):
                 if len(chars) > 0:
-                    chars.pop()
-                    sys.stdout.write('\b \b')
-                    sys.stdout.flush()
+                    chars.pop(); sys.stdout.write('\b \b'); sys.stdout.flush()
             else:
-                chars.append(char)
-                sys.stdout.write(char)
-                sys.stdout.flush()
-        
-        total_time = time.time() - start_time
-        return "".join(chars).strip().lower(), total_time
+                chars.append(char); sys.stdout.write(char); sys.stdout.flush()
+        # Full case-insensitivity and whitespace stripping
+        return "".join(chars).strip().lower(), (time.time() - start_time)
 
-    def run_phase(self, questions, mode):
-        print(f"\n{'='*50}\nPHASE: {mode.upper()}\n{'='*50}")
-        for i, q in enumerate(questions):
-            print(f"\nQ{i+1}: {q['text']}")
-            ans, lat = self.tracked_input()
+    def run_session(self, baseline_qs, target_qs):
+        if self.mode == "C":
+            p_id = input("Enter Control Participant ID: ")
+            for q in target_qs:
+                print(f"\nQ: {q['text']}")
+                ans, lat = self.tracked_input()
+                is_correct = 1 if ans == q['answer'] else 0
+                self.manager.log_control_result(p_id, q['id'], is_correct, lat)
+            print("\nControl data logged successfully.")
 
-            # Logic: BCI scales from 1.0 down based on time
-            bci = self.calculate_scaled_bci(lat)
-            delta_c = bci - q['p_obj']
-            is_correct = 1 if any(ext in ans for ext in q['correct_keywords']) else 0
+        else:
+            self.print_p_obj_summary()
+            print("\n--- PHASE 1: TRAP BASELINE (Cognitive Warmup) ---")
+            for q in baseline_qs:
+                print(f"\nQ: {q['text']}")
+                self.tracked_input()
 
-            print(f"--- [Metrics] Latency: {lat:.2f}s | BCI: {bci:.4f} | Delta_C: {delta_c:.2f} ---")
+            print("\n--- PHASE 2: TARGET EXPERIMENT ---")
+            for q in target_qs:
+                p_obj = self.p_obj_map.get(q['id'], 0.5)
+                print(f"\nQ: {q['text']}")
+                ans, lat = self.tracked_input()
+                is_correct = 1 if ans == q['answer'] else 0
+                
+                bci = self.calculate_bci(lat)
+                delta_c = bci - p_obj
 
-            if mode == "experimental" and delta_c > self.nudge_threshold:
-                self.nudges_triggered += 1
-                print("\n⚠️  [NUDGE]: Overconfidence detected.")
-                time.sleep(3)
-                print("RE-EVALUATE: Enter your final answer:")
-                final_ans, _ = self.tracked_input()
-                if any(ext in final_ans for ext in q['correct_keywords']) and is_correct == 0:
-                    self.corrections += 1
-                is_correct = 1 if any(ext in final_ans for ext in q['correct_keywords']) else 0
-
-            entry = {'bci': bci, 'outcome': is_correct, 'is_trap': q['p_obj'] < 0.4}
-            if mode == "control": self.results_control.append(entry)
-            elif mode == "experimental": self.results_exp.append(entry)
+                if delta_c > self.nudge_threshold:
+                    self.nudges += 1
+                    print(f"\n⚠️ [AI NUDGE] High Confidence ({bci:.2f}) vs Difficulty ({p_obj:.2f})")
+                    time.sleep(2)
+                    print("RE-EVALUATE: Re-type your final answer:")
+                    final_ans, _ = self.tracked_input()
+                    if final_ans == q['answer'] and is_correct == 0:
+                        self.corrections += 1
+                    is_correct = 1 if final_ans == q['answer'] else 0
             
-            if mode == "calibration":
-                self.personal_stats['latency'].append(lat)
+            print(f"\nNudges Triggered: {self.nudges} | Errors Prevented: {self.corrections}")
 
-    def print_final_report(self):
-        print(f"\n{'='*50}\nISEF PERFORMANCE REPORT\n{'='*50}")
-        def get_acc(res_list):
-            traps = [r['outcome'] for r in res_list if r['is_trap']]
-            return (sum(traps) / len(traps) * 100) if traps else 0
-        
-        acc_c = get_acc(self.results_control)
-        acc_e = get_acc(self.results_exp)
-
-        print(f"Trap Accuracy (Control): {acc_c:.1f}%")
-        print(f"Trap Accuracy (Experimental): {acc_e:.1f}%")
-        print(f"Improvement: {acc_e - acc_c:+.1f}%")
-        
-        eta = self.corrections / self.nudges_triggered if self.nudges_triggered > 0 else 0
-        print(f"\nNudges Triggered: {self.nudges_triggered}")
-        print(f"Errors Prevented: {self.corrections}")
-        print(f"Nudge Efficiency (η): {eta:.2f}")
-
-# Database (Same as previous for consistency)
-calibration_qs = [
-    {"text": "10 + 10?", "correct_keywords": ["20"], "p_obj": 0.99},
-    {"text": "Opposite of 'up'?", "correct_keywords": ["down"], "p_obj": 0.99},
-    {"text": "Color of a strawberry?", "correct_keywords": ["red"], "p_obj": 0.95},
-    {"text": "How many legs on a dog?", "correct_keywords": ["4", "four"], "p_obj": 0.99},
-    {"text": "5 x 5?", "correct_keywords": ["25"], "p_obj": 0.95},
-    {"text": "Capital of France?", "correct_keywords": ["paris"], "p_obj": 0.95},
-    {"text": "Freeze point of water (C)?", "correct_keywords": ["0", "zero"], "p_obj": 0.90},
-    {"text": "What do bees make?", "correct_keywords": ["honey"], "p_obj": 0.98},
-    {"text": "What is the sun?", "correct_keywords": ["star"], "p_obj": 0.95},
-    {"text": "Opposite of 'black'?", "correct_keywords": ["white"], "p_obj": 0.99},
+# --- 10 ALL-TRAP BASELINE QUESTIONS ---
+baseline_qs = [
+    {"text": "A man has 17 sheep. All but 9 die. How many are left?", "answer": "9"},
+    {"text": "What color is the bear if a man walks 1 mile S, 1 mile E, 1 mile N and is back home?", "answer": "white"},
+    {"text": "If a plane crashes on the border of USA and Canada, where do you bury survivors?", "answer": "none"},
+    {"text": "How many of each animal did Moses take on the Ark?", "answer": "0"}, # Trap: It was Noah
+    {"text": "If you are in a race and pass the person in last place, what place are you in?", "answer": "none"}, # Trap: Impossible
+    {"text": "A doctor gives you 3 pills and tells you to take 1 every 30 mins. How long until they are gone?", "answer": "60"}, # Trap: People say 90
+    {"text": "If you have 3 apples and take away 2, how many do YOU have?", "answer": "2"},
+    {"text": "Divide 30 by 0.5 and add 10. What is the result?", "answer": "70"}, # Trap: People say 25
+    {"text": "A father and son are in a car crash. The doctor says 'I can't operate, he is my son'. Who is the doctor?", "answer": "mother"},
+    {"text": "How many months have 28 days?", "answer": "12"}
 ]
 
-control_qs = [
-    {"text": "A bat and ball cost $1.10. Bat is $1 more. Ball cost in cents?", "correct_keywords": ["5", "five"], "p_obj": 0.15},
-    {"text": "Emily's father has 3 daughters: April, May, and...?", "correct_keywords": ["emily"], "p_obj": 0.25},
-    {"text": "How many months have 28 days?", "correct_keywords": ["12", "twelve", "all"], "p_obj": 0.20},
-    {"text": "Is 1 a prime number?", "correct_keywords": ["no"], "p_obj": 0.35},
-    {"text": "Divide 30 by 0.5 and add 10. Result?", "correct_keywords": ["70"], "p_obj": 0.20},
+# --- THE TARGET RESEARCH QUESTIONS ---
+target_qs = [
+    {"id": "CRT_A", "text": "A bat and ball cost $1.10. The bat is $1.00 more than the ball. Ball cost (cents)?", "answer": "5"},
+    {"id": "CRT_B", "text": "If 5 workers make 5 shirts in 5 mins, how long for 100 workers to make 100 shirts?", "answer": "5"},
+    {"id": "CRT_C", "text": "Lily pads double daily. It takes 48 days to cover a lake. How many days for half?", "answer": "47"},
+    {"id": "CRT_D", "text": "A clock strikes 6 in 5 seconds. How long does it take to strike 12?", "answer": "11"},
+    {"id": "CRT_E", "text": "Sally has 3 brothers. Each brother has 2 sisters. How many sisters does Sally have?", "answer": "1"}
 ]
 
-experimental_qs = [
-    {"text": "5 machines make 5 widgets in 5 mins. 100 machines make 100 in how many mins?", "correct_keywords": ["5", "five"], "p_obj": 0.25},
-    {"text": "Lily pads double daily. Cover lake in 48 days. Cover half in how many?", "correct_keywords": ["47"], "p_obj": 0.20},
-    {"text": "If you overtake the 2nd person in a race, what place are you in?", "correct_keywords": ["2", "second"], "p_obj": 0.30},
-    {"text": "A farmer has 17 sheep. All but 9 die. How many are left?", "correct_keywords": ["9", "nine"], "p_obj": 0.30},
-    {"text": "If you have 3 apples and take away 2, how many do YOU have?", "correct_keywords": ["2", "two"], "p_obj": 0.30},
-]
+# --- MAIN ---
+print("Mode C: Build your CSV with Group A data.")
+print("Mode E: Use Group A data to nudge Group B.")
+mode_choice = input("Select Mode (C/E): ").upper()
 
-guardian = EpistemicGuardian()
-guardian.run_phase(calibration_qs, mode="calibration")
-guardian.run_phase(control_qs, mode="control")
-guardian.run_phase(experimental_qs, mode="experimental")
-guardian.print_final_report()
+if mode_choice == "RESET": # Hidden command to clear data
+    os.remove("control_results.csv")
+    print("CSV Deleted.")
+else:
+    guardian = EpistemicGuardian(mode_choice)
+    guardian.run_session(baseline_qs, target_qs)
